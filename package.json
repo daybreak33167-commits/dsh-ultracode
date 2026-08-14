@@ -1,0 +1,40 @@
+{
+  "name": "dsh-ultracode",
+  "version": "0.1.0",
+  "description": "Claude Code ultracode-style session mode for DeepSeek Harness: top reasoning effort plus autonomous multi-agent orchestration",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "effort.js",
+    "host.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "ultracode",
+    "claude-code",
+    "orchestration"
+  ]
+}

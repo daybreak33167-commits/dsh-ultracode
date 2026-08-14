@@ -1,0 +1,8 @@
+# Ultracode session mode, modeled on Claude Code's "/effort ultracode":
+# top reasoning effort plus autonomous multi-agent orchestration.
+# Registers the /ultracode command, the ultracode:policy prompt section,
+# the effort override, and the ultracode projection.
+
+- insert:
+    - id: ultracode
+      name: dsh-ultracode
