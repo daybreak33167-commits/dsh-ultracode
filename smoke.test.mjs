@@ -60,14 +60,47 @@ assert.deepEqual(decodeEffortId('effort=XHigh|max=true'), [
   { id: 'max', value: 'true' },
 ])
 
+const run = (commandId, args) => ({ type: 'command/run', data: { commandId, name: 'ultracode', args, source: { kind: 'user' } } })
+const done = (commandId, kind) => ({ type: 'command/done', data: { commandId, kind } })
+
 const events = [
   { type: 'session/start', data: {} },
-  { type: 'ultracode/mode', data: { active: true } },
+  run('cmd-1', ''),
+  done('cmd-1', 'success'),
   { type: 'turn/start', data: {} },
-  { type: 'ultracode/mode', data: { active: false } },
+  run('cmd-2', ' off'),
+  done('cmd-2', 'success'),
 ]
-assert.equal(foldUltracode(events), false, 'last mode event wins')
-assert.equal(foldUltracode(events, 3), true, 'prefix fold')
+assert.equal(foldUltracode(events), false, 'last successful command wins')
+assert.equal(foldUltracode(events, 4), true, 'prefix fold sees only the first pair')
+assert.equal(foldUltracode(events, 5), true, 'unsettled run leaves the fold alone')
 assert.equal(foldUltracode([]), false, 'empty log inactive')
+
+assert.equal(
+  foldUltracode([run('cmd-3', ''), done('cmd-3', 'error')]),
+  false,
+  'errored command changes nothing',
+)
+assert.equal(
+  foldUltracode([
+    { type: 'command/run', data: { commandId: 'cmd-4', name: 'ultracode', source: { kind: 'user' } } },
+    done('cmd-4', 'success'),
+  ]),
+  false,
+  'run with unrecorded args states no intent',
+)
+assert.equal(
+  foldUltracode([
+    { type: 'command/run', data: { commandId: 'cmd-5', name: 'compact', args: '', source: { kind: 'user' } } },
+    done('cmd-5', 'success'),
+  ]),
+  false,
+  'other commands are ignored',
+)
+assert.equal(
+  foldUltracode([run('cmd-6', ' focus on the API layer'), done('cmd-6', 'success')]),
+  true,
+  'message argument still turns the mode on',
+)
 
 console.log('smoke: all assertions passed')

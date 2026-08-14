@@ -6,10 +6,15 @@
  * the system prompt so the agent fans substantive tasks out across parallel
  * subagents/workflows instead of grinding through one overloaded context.
  *
- * The state machine mirrors @deepseek-ai/dsh-plan-mode: mode flips are logged
- * per-session (`ultracode/mode`, last one wins) so resume and fork restore
- * them; a flip requested during an open turn stays pending until the next
- * accepted pre-step.
+ * Durable state rides the command lifecycle events `dsh-commands` already
+ * logs for every execution (`command/run` + `command/done`, both in the
+ * harness's known event vocabulary): the last successful `/ultracode`
+ * command decides the mode, so resume, fork, and cold transcript reads
+ * reconstruct it without this plugin appending any custom event type. The
+ * persistence read path refuses logs holding unknown event types unless each
+ * such event is marked ignorable, and `Session.append()` offers no way for an
+ * out-of-tree plugin to set that marker — so a plugin-owned event type would
+ * poison every log it touches for readers without a registration surface.
  */
 import { importHost } from './host.js'
 import { installEffortOverride } from './effort.js'
@@ -27,7 +32,7 @@ try {
   z = undefined
 }
 
-const MODE_EVENT = 'ultracode/mode'
+const COMMAND = 'ultracode'
 
 const DEFAULT_SECTION = `# Ultracode mode
 
@@ -54,29 +59,35 @@ effort and autonomous orchestration. Calibrate the machinery to the task.
 - Report delegated work faithfully: if a subagent fails, stalls, or returns
   something doubtful, verify or redo it rather than papering over it.`
 
+/** The mode one `/ultracode` invocation asks for, from its recorded args. */
+function wantedFromArgs(args) {
+  return args.trim() !== 'off'
+}
+
 /**
- * Whether ultracode is active after the first `end` events. The last
- * `ultracode/mode` wins; a prefix with none is inactive.
+ * Whether ultracode is active after the first `end` events: the last
+ * `/ultracode` command whose `command/done` settled `success` wins (pairing
+ * by commandId). A run with unrecorded args cannot state an intent and a run
+ * that settled `error` never changed anything, so both leave the fold alone.
  */
 export function foldUltracode(events, end = events.length) {
   let active = false
+  const open = new Map()
   let index = 0
   for (const event of events) {
     if (index >= end) break
     index += 1
-    if (event.type === MODE_EVENT) active = event.data.active
+    if (event.type === 'command/run') {
+      if (event.data.name !== COMMAND || typeof event.data.args !== 'string') continue
+      open.set(event.data.commandId, wantedFromArgs(event.data.args))
+    } else if (event.type === 'command/done') {
+      const wanted = open.get(event.data.commandId)
+      if (wanted === undefined) continue
+      open.delete(event.data.commandId)
+      if (event.data.kind === 'success') active = wanted
+    }
   }
   return active
-}
-
-/** Whether the log holds an opened turn without its closing `turn/end`. */
-function hasOpenTurn(events) {
-  let open = false
-  for (const event of events) {
-    if (event.type === 'turn/start') open = true
-    else if (event.type === 'turn/end') open = false
-  }
-  return open
 }
 
 /** Mode state at the last logged request header, or undefined before the first header. */
@@ -102,16 +113,16 @@ function resolveSection(config) {
 
 export function apply(ctx, config = {}) {
   const section = resolveSection(config)
+
+  const effective = (session) => foldUltracode(session.events)
+
   /**
-   * Latest selection per session awaiting the next accepted in-turn pre-step.
-   * `narrate` marks user selections whose switch notice should ride the step.
+   * Build a user-switch notice when the mode the model was last told (at the
+   * last logged request header) differs from the current fold. Undefined
+   * before the first header: the system prompt already reflects the mode.
    */
-  const pendingIntents = new WeakMap()
-
-  const effective = (session) => pendingIntents.get(session)?.active ?? foldUltracode(session.events)
-
-  /** Build a user-switch notice when the last logged header described the other mode. */
-  const narration = (session, target) => {
+  const narration = (session) => {
+    const target = foldUltracode(session.events)
     const told = modeAtLastHeader(session.events)
     if (told === undefined || told === target) return undefined
     const text = target
@@ -123,56 +134,12 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  /** Append one pending selection before the next request assembly. */
-  const onBoundary = (session) => {
-    const pending = pendingIntents.get(session)
-    if (pending === undefined) return
-    if (pending.active === foldUltracode(session.events)) {
-      pendingIntents.delete(session)
-      return
-    }
-    session.append(MODE_EVENT, { active: pending.active })
-    pendingIntents.delete(session)
-  }
-
-  /**
-   * Select whether ultracode should be active. Idle sessions commit the flip
-   * immediately; during an open turn it stays pending until the next accepted
-   * pre-step. Returns committed | queued | cancelled | noop (plan-mode's
-   * contract).
-   */
-  const set = (agent, active) => {
-    const session = agent.session
-    if (active === effective(session)) return 'noop'
-    if (hasOpenTurn(session.events)) {
-      pendingIntents.set(session, { active, narrate: true })
-      return foldUltracode(session.events) === active ? 'cancelled' : 'queued'
-    }
-    if (active === foldUltracode(session.events)) {
-      pendingIntents.delete(session)
-      return 'cancelled'
-    }
-    session.append(MODE_EVENT, { active })
-    pendingIntents.delete(session)
-    const notice = narration(session, active)
-    if (notice !== undefined) agent.inject(notice)
-    return 'committed'
-  }
-
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
-    const pending = pendingIntents.get(agent.session)
-    if (decision.kind === 'reject' || signal.aborted || pending === undefined) return decision
-    const notice = narration(agent.session, pending.active)
-    try {
-      onBoundary(agent.session)
-    } catch (error) {
-      ctx.logger.warn('dsh-ultracode: failed to append selected mode at step start: %o', error)
-      return decision
-    }
-    return !pending.narrate || notice === undefined
-      ? decision
-      : { ...decision, messages: [...decision.messages, notice] }
+    if (decision.kind === 'reject' || signal.aborted) return decision
+    const notice = narration(agent.session)
+    if (notice === undefined) return decision
+    return { ...decision, messages: [...decision.messages, notice] }
   })
 
   ctx.systemPrompt.section({
@@ -188,46 +155,32 @@ export function apply(ctx, config = {}) {
 
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.commands.register({
-      name: 'ultracode',
+      name: COMMAND,
       description: 'Enter or leave ultracode mode (top reasoning effort + autonomous orchestration)',
       input: { hint: '[off|message]' },
       handler: ({ agent, rawInput }) => {
+        // This invocation's own `command/run` is already logged but its
+        // `command/done` is not, so the fold still reads the prior state;
+        // the flip lands with the success `command/done` this return causes.
+        const before = foldUltracode(agent.session.events)
         const message = rawInput.trim()
         if (message === 'off') {
-          switch (set(agent, false)) {
-            case 'committed':
-              return { kind: 'success', text: 'Ultracode mode off.' }
-            case 'queued':
-              return { kind: 'success', text: 'Leaving ultracode mode (applies from the next step).' }
-            case 'cancelled':
-              return { kind: 'success', text: 'Ultracode mode entry cancelled.' }
-            case 'noop':
-              return foldUltracode(agent.session.events)
-                ? { kind: 'success', text: 'Leaving ultracode mode (applies from the next step).' }
-                : { kind: 'success', text: 'Ultracode mode is already inactive.' }
+          return {
+            kind: 'success',
+            text: before ? 'Ultracode mode off.' : 'Ultracode mode is already inactive.',
           }
         }
-        const outcome = set(agent, true)
         if (message !== '') {
           agent.steer(createUserMessage({
             content: [{ type: 'text', text: message }],
             source: { kind: 'user' },
           }))
         }
-        switch (outcome) {
-          case 'committed':
-            return {
-              kind: 'success',
-              text: 'Ultracode mode on: top reasoning effort + autonomous orchestration. Use /ultracode off to leave.',
-            }
-          case 'cancelled':
-            return { kind: 'success', text: 'Ultracode mode stays on (pending exit cancelled).' }
-          case 'noop':
-            return foldUltracode(agent.session.events)
-              ? { kind: 'success', text: 'Ultracode mode is already active.' }
-              : { kind: 'success', text: 'Entering ultracode mode (applies from the next step). Use /ultracode off to leave.' }
-          default:
-            return { kind: 'success', text: 'Entering ultracode mode (applies from the next step). Use /ultracode off to leave.' }
+        return {
+          kind: 'success',
+          text: before
+            ? 'Ultracode mode is already active.'
+            : 'Ultracode mode on: top reasoning effort + autonomous orchestration. Use /ultracode off to leave.',
         }
       },
     })
@@ -241,21 +194,28 @@ export function apply(ctx, config = {}) {
     projectionCtx.sessionProjections.register({
       key: 'ultracode',
       schema: z.object({ active: z.boolean(), pending: z.boolean() }),
-      init: () => ({ active: false, wanted: null }),
+      init: () => ({ active: false, open: {} }),
       apply: (state, event) => {
-        if (event.type === 'command/run' && event.data.name === 'ultracode') {
-          if (event.data.args === undefined) return state
-          const wanted = event.data.args.trim() !== 'off'
-          return wanted === state.wanted ? state : { active: state.active, wanted }
+        if (event.type === 'command/run') {
+          if (event.data.name !== COMMAND || typeof event.data.args !== 'string') return state
+          return {
+            active: state.active,
+            open: { ...state.open, [event.data.commandId]: wantedFromArgs(event.data.args) },
+          }
         }
-        if (event.type === MODE_EVENT) return { active: event.data.active, wanted: null }
+        if (event.type === 'command/done') {
+          const wanted = state.open[event.data.commandId]
+          if (wanted === undefined) return state
+          const { [event.data.commandId]: _, ...open } = state.open
+          return { active: event.data.kind === 'success' ? wanted : state.active, open }
+        }
         return state
       },
       view: (state) => ({
         active: state.active,
-        pending: state.wanted !== null && state.wanted !== state.active,
+        pending: Object.values(state.open).some((wanted) => wanted !== state.active),
       }),
-      stateVersion: 1,
+      stateVersion: 2,
     })
   })
 }

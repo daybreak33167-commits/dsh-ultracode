@@ -50,9 +50,17 @@ Optional plugin config (via a `cordis.patch.yml` layer):
 
 ## How it works
 
-- State is a custom session-log event `ultracode/mode` (last one wins),
-  folded on read — the same state machine as `@deepseek-ai/dsh-plan-mode`,
-  including pending switches committed at the next accepted pre-step.
+- State is folded from the `command/run`/`command/done` lifecycle events
+  `@deepseek-ai/dsh-commands` already logs for every execution: the last
+  `/ultracode` command whose `command/done` settled `success` wins. No custom
+  event type is appended — DSH's persistence read path refuses logs holding
+  event types outside its generated known set unless each event carries the
+  `ignorable` envelope marker, and `Session.append()` gives plugins no way to
+  set it, so an out-of-tree event type would make every touched session
+  unreadable on cold loads (`SessionFormatUnsupportedError`).
+- When the mode at the last logged `request/header` differs from the current
+  fold, the next accepted pre-step rides a switch notice into the request, so
+  the model is told about mid-session flips.
 - The prompt section registers as `ultracode:policy` (order 55) through
   `ctx.systemPrompt.section` and renders only while the mode is active.
 - The effort override is an `agent/request` waterfall listener (prepended, so
